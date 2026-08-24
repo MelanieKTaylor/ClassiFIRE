@@ -1,5 +1,6 @@
 # ClassiFIRE
-ClassiFIRE classifies remotely sensed fire detections as wildfire or prescribed (Rx) fire by comparing them in space and time to wildfire reports. 
+ClassiFIRE classifies remotely sensed fire detections as wildfire or prescribed (Rx) fire. We followed these basic steps: 
+
 
 Note: This workflow, ClassiFIRE, is an academic research tool and is not affiliated with or endorsed by any commercial entity.
 
