@@ -1,0 +1,231 @@
+---
+title: "ClassiFIRE"
+output: html_document
+date: "2026-06-01"
+---
+prep
+```{r}
+# packages
+library(ranger)
+library(tidyverse)
+
+# --- DYNAMIC PATH CONFIGURATION ---
+if (!exists("base_dir")) {
+  base_dir <- getwd()
+}
+
+data_path <- file.path(base_dir, "data", "SEFM_events_94_24_matching_complete_01JUN2026.csv")
+erc_path  <- file.path(base_dir, "data", "fire_erc_percentiles.csv")
+
+# 1. Load Datasets and Join
+data <- read.csv(data_path)
+erc  <- read.csv(erc_path)
+
+unique(data_erc$classification)
+str(data_erc)
+
+# Convert categorical text/numeric codes into distinct categories (factors)
+data_erc$classification <- as.factor(data_erc$classification)
+data_erc$ecol3_mode     <- as.factor(data_erc$ecol3_mode)
+data_erc$nlcdr_mode     <- as.factor(data_erc$nlcdr_mode)
+
+# 2. Ensure numeric columns are correctly typed
+data_erc$midpoint_month <- as.integer(data_erc$midpoint_month)
+data_erc$SUM_area_ha    <- as.numeric(data_erc$SUM_area_ha)
+data_erc$year_mode <- as.numeric(data_erc$year_mode)
+data_erc$absolute_mean_erc <- as.numeric(data_erc$absolute_mean_erc)
+data_erc$totality_percentile <- as.numeric(data_erc$totality_percentile)
+
+# Round ercs to 2 decimal places
+data_erc$absolute_mean_erc <- round(data_erc$absolute_mean_erc, digits = 2)
+data_erc$totality_percentile <- round(data_erc$totality_percentile, digits = 2)
+
+# Create the record_match column (1 if it has a label, 0 if it's empty)
+data_erc$record_match <- 
+  ifelse(data_erc$classification %in% c("wildfire", "prescribed"), 1, 0)
+
+# Verify that the new column populated correctly
+table(data_erc$record_match, useNA = "always")
+
+# Isolate the matched records (where record_match is 1)
+matched_pool <- data_erc %>% 
+  filter(record_match == 1)
+str(matched_pool)
+
+# Drop any empty ghost levels from the factor columns
+matched_pool <- droplevels(matched_pool)
+
+# Verify that classification now only has 2 levels
+levels(matched_pool$classification)
+```
+
+train/validation split
+```{r}
+# 1. Set a random seed so this exact split can be reproduced later
+set.seed(42)
+
+# 2. Calculate the number of rows that make up 80% of the data
+train_size <- floor(0.80 * nrow(matched_pool))
+
+# 3. Randomly select the row indices for the training set
+train_indices <- sample(seq_len(nrow(matched_pool)), size = train_size)
+
+# 4. Separate the data into two distinct data frames
+train_set <- matched_pool[train_indices, ]
+valid_set <- matched_pool[-train_indices, ]
+
+# 5. Print out the final row counts to verify
+cat("Training set rows:", nrow(train_set), "\n")
+cat("Validation set rows:", nrow(valid_set), "\n")
+```
+
+ClassiFIRE. 
+```{r}
+library(ranger)
+
+# --- 1. FIT RANGER PROBABILITY MODEL ---
+rf_model_v7_prob <- ranger(
+  formula         = classification ~ SUM_area_ha + ecol3_mode + nlcdr_mode + 
+                    midpoint_month + absolute_mean_erc + totality_percentile,
+  data            = train_set,
+  num.trees       = 500,
+  importance      = "impurity",
+  probability     = TRUE,
+  verbose         = TRUE,
+  mtry            = 4
+)
+
+print(rf_model_v7_prob)
+
+# --- 2. VALIDATION SET PREDICTIONS ---
+# Extract predicted probabilities for prescribed fire class
+val_predictions_v7 <- predict(rf_model_v7_prob, data = valid_set)
+prob_prescribed_val <- val_predictions_v7$predictions[, "prescribed"]
+
+# Map probabilities to hard labels using a 0.50 decision threshold
+predicted_labels_v7 <- ifelse(prob_prescribed_val >= 0.50, "prescribed", "wildfire")
+predicted_labels_v7 <- factor(predicted_labels_v7, levels = c("prescribed", "wildfire"))
+
+# --- 3. CONFUSION MATRIX & ACCURACY ---
+conf_matrix_v7 <- table(Actual = valid_set$classification, Predicted = predicted_labels_v7)
+
+cat("\n--- CONFUSION MATRIX (0.50 THRESHOLD) ---\n")
+print(conf_matrix_v7)
+
+accuracy_v7 <- sum(diag(conf_matrix_v7)) / sum(conf_matrix_v7)
+cat(paste0("\nOverall Accuracy: ", round(accuracy_v7 * 100, 2), "%\n"))
+
+# --- 4. VARIABLE IMPORTANCE ---
+base_importance_v7 <- importance(rf_model_v7_prob)
+base_importance_df_v7 <- data.frame(
+  Variable   = names(base_importance_v7),
+  Importance = as.numeric(base_importance_v7)
+)
+base_importance_df_v7 <- base_importance_df_v7[order(-base_importance_df_v7$Importance), ]
+
+cat("\n--- VARIABLE IMPORTANCE ---\n")
+print(base_importance_df_v7, row.names = FALSE)
+
+# --- 5. DETAILED CLASS METRICS ---
+TP <- conf_matrix_v7["wildfire", "wildfire"]     # True Wildfires
+TN <- conf_matrix_v7["prescribed", "prescribed"] # True Prescribed
+FP <- conf_matrix_v7["prescribed", "wildfire"]   # Prescribed misclassified as Wildfire
+FN <- conf_matrix_v7["wildfire", "prescribed"]   # Wildfire misclassified as Prescribed
+
+# Calculate Precision, Recall, and F1-Score per class
+wf_recall    <- TP / (TP + FN)
+wf_precision <- TP / (TP + FP)
+wf_f1        <- 2 * (wf_precision * wf_recall) / (wf_precision + wf_recall)
+
+rx_recall    <- TN / (TN + FP)
+rx_precision <- TN / (TN + FN)
+rx_f1        <- 2 * (rx_precision * rx_recall) / (rx_precision + rx_recall)
+
+cat("\n--- WILDFIRE METRICS ---\n")
+cat("Recall (Capture Rate):  ", round(wf_recall * 100, 2), "%\n")
+cat("Precision (Reliability):", round(wf_precision * 100, 2), "%\n")
+cat("F1-Score:               ", round(wf_f1, 4), "\n\n")
+
+cat("--- PRESCRIBED METRICS ---\n")
+cat("Recall (Capture Rate):  ", round(rx_recall * 100, 2), "%\n")
+cat("Precision (Reliability):", round(rx_precision * 100, 2), "%\n")
+cat("F1-Score:               ", round(rx_f1, 4), "\n")
+```
+
+Apply v7 to unmatched data
+
+```{r}
+unmatched_pool <- data_erc %>% 
+  filter(record_match == 0)
+
+# Count how many cells are completely blank ("") or missing (NA)
+data_erc %>%
+  summarise(
+    blank_classification = sum(classification == "" | is.na(classification)),
+    blank_ecol3          = sum(ecol3_mode == "" | is.na(ecol3_mode)),
+    blank_nlcdr          = sum(nlcdr_mode == "" | is.na(nlcdr_mode))
+  )
+
+# Drop any empty ghost levels from the factor columns
+unmatched_pool <- droplevels(unmatched_pool)
+
+# Convert empty strings to NA and match training set levels structure
+unmatched_pool$classification <- factor(unmatched_pool$classification, levels = levels(train_set$classification))
+unmatched_pool$ecol3_mode <- factor(unmatched_pool$ecol3_mode, levels = levels(train_set$ecol3_mode))
+unmatched_pool$nlcdr_mode <- factor(unmatched_pool$nlcdr_mode, levels = levels(train_set$nlcdr_mode))
+
+# -------------------------------------------------------------
+# RUN PROBABILITY PREDICTION ACROSS 1.62 MILLION ROWS
+# -------------------------------------------------------------
+cat("Deploying ClassiFIRE probability forest...\n")
+predictions_unmatched <- predict(rf_model_v7_prob, data = unmatched_pool)
+
+# Extract raw probabilities of being a prescribed fire and append to unmatched dataframe
+unmatched_pool$prob_prescribed <- predictions_unmatched$predictions[, "prescribed"]
+
+
+# -------------------------------------------------------------
+# STITCH MATCHED AND UNMATCHED BACK TOGETHER
+# -------------------------------------------------------------
+
+cat("\nStitching matched and unmatched pools together...\n")
+sefm_classifired <- bind_rows(matched_pool, unmatched_pool)
+
+cat("\n--- Master Dataset Stitch Verification ---\n")
+cat("Total Rows:", nrow(sefm_classifired), "\n")
+
+# Verify the NA alignment logic across the final joined dataset
+print(table(Is_NA_Prob = is.na(sefm_classifired$prob_prescribed), 
+            Record_Match = sefm_classifired$record_match))
+
+#create prob_wildfire
+sefm_classifired <- sefm_classifired %>%
+  mutate(
+    prob_wildfire = ifelse(is.na(prob_prescribed), NA_real_, 1 - prob_prescribed)
+  )
+
+#create class_prob, shows prob of class at 50%
+sefm_classifired <- sefm_classifired %>%
+  mutate(
+    # If it's a matched record, keep it NA. 
+    # Otherwise, grab the probability that matches the predicted label.
+    class_prob = case_when(
+      is.na(prob_prescribed) ~ NA_real_,
+      class_pred_50 == "prescribed" ~ prob_prescribed,
+      class_pred_50 == "wildfire"   ~ (1 - prob_prescribed)
+    )
+  )
+
+# Verify a few rows to make sure the logic mapped 
+sefm_classifired %>%
+  filter(record_match == 0) %>%
+  select(class_pred_50, prob_prescribed, class_prob) %>%
+  head(10)
+
+# Export
+write.csv(sefm_classifired, "output.csv", row.names = FALSE)
+```
+
+
+
+
